@@ -1,0 +1,88 @@
+- name: node join k8s cluster
+  hosts: nodes
+  vars:
+    master: "192.168.10.100:6443"
+    token: "4j1niq.grmtqn2heb3o2r3x"
+    token_hash: "sha256:5ec92aaad82d5cce33e227b1c1680f38d9d3210778b3180fa919073647240f78"
+  tasks:
+    - name: disable swap from fstab file
+      lineinfile:
+        path: /etc/fstab
+        state: absent
+        regexp: 'swap'
+    - name: remove firewalld packages
+      yum:
+        name: "firewalld-*"
+        state: absent
+    - template:
+        src: k8s.repo.j2
+        dest: /etc/yum.repos.d/k8s.repo
+    - shell: yum clean all && yum makecache 
+    - name: install k8s node packages
+      shell: yum -y install kubeadm kubelet kubectl containerd.io ipvsadm ipset iproute-tc --allowerasing
+    - name: update modify config.toml
+      template:
+        src: config.j2
+        dest: /etc/containerd/config.toml
+        owner: root
+        group: root
+        mode: '0644'
+    - name: create containerd.conf
+      copy:
+        dest: /etc/modules-load.d/containerd.conf
+        owner: root
+        group: root
+        mode: '0644'
+        content: |
+          overlay
+          br_netfilter
+          xt_conntrack
+    - name: create 99-kubernetes-cri.conf
+      copy:
+        dest: /etc/sysctl.d/99-kubernetes-cri.conf
+        owner: root
+        group: root
+        mode: '0644'
+        content: |
+          net.ipv4.ip_forward = 1
+          net.bridge.bridge-nf-call-iptables = 1
+          net.bridge.bridge-nf-call-ip6tables = 1
+          net.netfilter.nf_conntrack_max = 1000000
+    - shell: |
+        modprobe br_netfilter
+        modprobe nf_conntrack
+    - name: set /etc/hosts
+      copy:
+        dest: /etc/hosts
+        owner: root
+        group: root
+        mode: '0644'
+        content: |
+          ::1		localhost localhost.localdomain localhost6 localhost6.localdomain6
+          127.0.0.1	localhost localhost.localdomain localhost4 localhost4.localdomain4
+          192.168.10.240	harbor
+          192.168.10.100	master
+          {% for i in groups.nodes %}
+          {{ hostvars[i].ansible_eth0.ipv4.address }}	{{ hostvars[i].ansible_hostname }}
+          {% endfor %}
+    - name: enable k8s kubelet,runtime service
+      service:
+        name: "{{ item }}"
+        state: started
+        enabled: true
+      loop:
+        - systemd-modules-load
+        - containerd
+        - kubelet
+    - name: check node state
+      stat:
+        path: /etc/kubernetes/kubelet.conf
+      register: result
+    - name: node join cluster
+      shell: |
+        swapoff -a
+        sysctl -p /etc/sysctl.d/99-kubernetes-cri.conf
+        kubeadm join {{ master }} --token {{ token }} --discovery-token-ca-cert-hash {{ token_hash }}
+      args:
+        executable: /bin/bash
+      when: result.stat.exists == False
